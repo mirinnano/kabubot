@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,7 +14,25 @@ import (
 
 type Scheduler struct {
 	*gocron.Scheduler
-	logger *zap.Logger
+	logger         *zap.Logger
+	summaryService *SummaryService
+}
+
+func (s *Scheduler) AddSummaryJob(schedule string) {
+	_, err := s.Scheduler.Cron(schedule).Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		
+		s.logger.Info("要約生成ジョブを開始します", zap.Any("context", ctx))
+		// TODO: データベースから未要約の記事を取得し、要約処理を実行
+		// s.summaryService.GenerateAndStoreSummary(ctx, articleID, content)
+	})
+	
+	if err != nil {
+		s.logger.Error("要約ジョブの追加に失敗しました",
+			zap.String("schedule", schedule),
+			zap.Error(err))
+	}
 }
 
 func (s *Scheduler) AddTask(schedule string, task func()) {
@@ -25,11 +44,16 @@ func (s *Scheduler) AddTask(schedule string, task func()) {
 	}
 }
 
-func NewScheduler(discord *discordgo.Session, logger *zap.Logger) *Scheduler {
+func NewScheduler(
+	discord *discordgo.Session, 
+	logger *zap.Logger,
+	summaryService *SummaryService,
+) *Scheduler {
 	s := gocron.NewScheduler(time.UTC)
 	return &Scheduler{
-		Scheduler: s,
-		logger:    logger,
+		Scheduler:      s,
+		logger:         logger,
+		summaryService: summaryService,
 	}
 }
 

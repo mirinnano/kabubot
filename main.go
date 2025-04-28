@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,8 +12,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/launcher"
+	"github.com/gocolly/colly/v2"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -76,19 +76,48 @@ func main() {
 		)
 	})
 
-	scheduler := services.NewScheduler(discord, logger)
+	var cfg config.Config
+	if err := viper.Unmarshal(&cfg); err != nil {
+		logger.Fatal("設定の読み込みに失敗しました", zap.Error(err))
+	}
+	summaryService := services.NewSummaryService(&cfg.AI, logger, db)
+	scheduler := services.NewScheduler(discord, logger, summaryService)
 	scheduler.Start()
 
 	// フィルターパラメータは設定ファイルから取得可能
-	kabutanFilter := viper.GetString("kabutan.filter")       // 通常フィルター
-	irFilter := viper.GetString("kabutan.ir_filter")         // IR専用フィルター
+	kabutanFilter := viper.GetString("kabutan.filter") // 通常フィルター
+	irFilter := viper.GetString("kabutan.ir_filter")   // IR専用フィルター
 
-	// 通常モード（5分間隔）
-	scheduler.AddTask("*/5 * * * *", func() {
+	// 通常モード（設定ファイルから間隔を取得）
+	scheduler.AddTask(viper.GetString("scraping.interval"), func() {
 		articles := scrapeKabutanArticles(logger, kabutanFilter)
 		if len(articles) > 0 {
 			logger.Info("通常スクレイピング結果", zap.Int("記事数", len(articles)))
 			processAndNotify(discord, logger, articles)
+		}
+	})
+
+	// リアルタイムIR通知モード（市場時間中30秒間隔）
+	// 6時間前からの記事を要約するタスク
+	scheduler.AddTask("0 */6 * * *", func() {
+		var articles []Article
+		sixHoursAgo := time.Now().Add(-6 * time.Hour)
+
+		if result := db.Where("published_at >= ? AND summary = ''", sixHoursAgo).Find(&articles); result.Error != nil {
+			logger.Error("要約対象記事の取得に失敗しました", zap.Error(result.Error))
+			return
+		}
+
+		logger.Info("要約処理を開始します",
+			zap.Int("対象記事数", len(articles)),
+			zap.Time("基準時刻", sixHoursAgo))
+
+		for _, article := range articles {
+			if err := summaryService.GenerateAndStoreSummary(context.Background(), int(article.ID), article.Body); err != nil {
+				logger.Error("記事要約に失敗しました",
+					zap.Int("article_id", int(article.ID)),
+					zap.Error(err))
+			}
 		}
 	})
 
@@ -99,6 +128,44 @@ func main() {
 			logger.Info("リアルタイムIR検出", zap.Int("件数", len(articles)))
 			// 緊急記事のみ別ルートで通知
 			processUrgentNotifications(discord, logger, articles)
+		}
+	})
+
+	// 6時間ごとの本文再取得タスク
+	scheduler.AddTask("0 */6 * * *", func() {
+		var articles []Article
+		twentyFourHoursAgo := time.Now().Add(-24 * time.Hour)
+		
+		// 最終スクレイピングから24時間以上経過かつリトライ回数3回未満の記事を取得
+		if result := db.Where("last_scraped_at < ? AND retry_count < ?", twentyFourHoursAgo, 3).Find(&articles); result.Error != nil {
+			logger.Error("再スクレイピング対象記事の取得に失敗しました", zap.Error(result.Error))
+			return
+		}
+
+		logger.Info("本文の再スクレイピングを開始します",
+			zap.Int("対象記事数", len(articles)),
+			zap.Time("基準時刻", twentyFourHoursAgo))
+
+		for _, article := range articles {
+			newBody := getArticleBody(logger, article.URL)
+			if newBody != "" && newBody != article.Body {
+				// 本文が更新されている場合のみデータベースを更新
+				updateResult := db.Model(&article).Updates(map[string]interface{}{
+					"body":            newBody,
+					"last_scraped_at": time.Now(),
+					"retry_count":     gorm.Expr("retry_count + 1"),
+				})
+				
+				if updateResult.Error != nil {
+					logger.Error("本文更新に失敗しました",
+						zap.Int("article_id", int(article.ID)),
+						zap.Error(updateResult.Error))
+				} else {
+					logger.Info("本文を正常に更新しました",
+						zap.Int("article_id", int(article.ID)),
+						zap.Int("文字数", len(newBody)))
+				}
+			}
 		}
 	})
 
@@ -119,260 +186,198 @@ func main() {
 
 // scrapeKabutanArticles 通常ニュース用スクレイパー
 func scrapeKabutanArticles(logger *zap.Logger, filterParam string) []map[string]interface{} {
-	baseURL := "https://kabutan.jp/news/marketnews/"
-	// filterParam があればクエリ文字列として付与
-	startURL := baseURL
-	if filterParam != "" {
-		startURL += "?" + filterParam
-	}
+	c := colly.NewCollector(
+		colly.AllowedDomains("kabutan.jp"),
+		colly.Async(true),
+		colly.CacheDir("./.cache"),
+	)
+
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 2,
+		RandomDelay: 2 * time.Second,
+	})
+
 	articles := make([]map[string]interface{}, 0)
+	baseURL := "https://kabutan.jp/news/marketnews/"
 
-	l := launcher.New().Headless(true)
-	defer l.Cleanup()
-	browser := rod.New().ControlURL(l.MustLaunch()).MustConnect()
-	defer browser.MustClose()
-
-	page := browser.MustPage(startURL)
-	page.Timeout(30 * time.Second).MustWaitLoad().MustWaitStable()
-
-	// テーブル要素取得 with retry
-	var table *rod.Element
-	for i := 0; i < 3; i++ {
-		t, err := page.Element(".s_news_list.mgbt0")
-		if err == nil {
-			table = t
-			break
-		}
-		logger.Warn("テーブル要素取得リトライ", zap.Int("attempt", i+1), zap.Error(err))
-		time.Sleep(2 * time.Second)
-	}
-	if table == nil {
-		logger.Error("テーブル要素の取得に失敗しました")
-		return nil
-	}
-	rows := table.MustElements("tr")
-
-	for _, row := range rows {
-		article := make(map[string]interface{})
-
-		// 日時
-		if tEl, err := row.Element("td.news_time time"); err == nil {
-			if dt, _ := tEl.Attribute("datetime"); dt != nil {
-				article["date"] = *dt
-			}
-		}
-
-		// カテゴリ + 緊急フラグ
-		if cEl, err := row.Element("td:nth-child(2) div.newslist_ctg"); err == nil {
-			article["category"] = cEl.MustText()
-			if cl, _ := cEl.Attribute("class"); cl != nil {
-				article["is_urgent"] = strings.Contains(*cl, "kk_b")
-			}
-		}
-
-		// 銘柄コード
-		if codeEl, err := row.Element("td:nth-child(3)"); err == nil {
-			if cd, _ := codeEl.Attribute("data-code"); cd != nil {
-				article["stock_code"] = *cd
-			}
-		}
-
-		// タイトル + URL
-		if titleEl, err := row.Element("td:nth-child(4) a"); err == nil {
-			article["title"] = titleEl.MustText()
-			if href, _ := titleEl.Attribute("href"); href != nil {
-				u, _ := url.Parse(baseURL)
-				article["url"] = u.ResolveReference(&url.URL{Path: *href}).String()
-			}
+	c.OnHTML(".s_news_list.mgbt0 tr", func(e *colly.HTMLElement) {
+		article := map[string]interface{}{
+			"date":       e.ChildAttr("td.news_time time", "datetime"),
+			"category":   e.ChildText("td:nth-child(2) div.newslist_ctg"),
+			"is_urgent":  strings.Contains(e.ChildAttr("td:nth-child(2) div.newslist_ctg", "class"), "kk_b"),
+			"stock_code": e.ChildAttr("td:nth-child(3)", "data-code"),
+			"title":      e.ChildText("td:nth-child(4) a"),
+			"url":        e.Request.AbsoluteURL(e.ChildAttr("td:nth-child(4) a", "href")),
 		}
 
 		if !hasRequiredFields(article) {
-			continue
+			return
 		}
 
-		// URL 正規化 + 重複フィルタ
 		norm, err := normalizeURL(article["url"].(string))
 		if err != nil {
 			logger.Warn("URL正規化エラー", zap.Error(err))
-			continue
+			return
 		}
 		article["url"] = norm
 
 		hash := generateHash(article["title"].(string), article["url"].(string), norm)
 		var exist Article
 		if err := db.Where("url = ? OR hash = ?", norm, hash).First(&exist).Error; err == nil {
-			continue
+			return
 		}
 
-		// DB 保存
-		var pub time.Time
-		if ds, ok := article["date"].(string); ok && ds != "" {
-			pt, err := time.Parse(time.RFC3339, ds)
-			if err != nil {
-				logger.Warn("日時パースエラー", zap.String("date", ds), zap.Error(err))
-				continue
-			}
-			pub = pt
+		pub, err := time.Parse(time.RFC3339, article["date"].(string))
+		if err != nil {
+			logger.Warn("日時パースエラー", zap.String("date", article["date"].(string)), zap.Error(err))
+			return
 		}
 
 		errMutex.Lock()
+		defer errMutex.Unlock()
 		if err := db.Create(&Article{
 			Title:       article["title"].(string),
 			URL:         norm,
 			Hash:        hash,
 			Content:     fmt.Sprintf("カテゴリ: %s", article["category"]),
+			Body:        getArticleBody(logger, e.Request.AbsoluteURL(e.ChildAttr("td:nth-child(4) a", "href"))),
 			Category:    article["category"].(string),
 			PublishedAt: pub,
 		}).Error; err != nil {
 			logger.Error("記事保存失敗", zap.Error(err))
 		} else {
+			if len(articles) >= 10 {
+				logger.Info("最大記事数に達したため通常記事の収集を停止", zap.Int("max_articles", 10))
+				return
+			}
 			articles = append(articles, article)
 		}
-		errMutex.Unlock()
-	}
+	})
 
-	page.MustClose()
+	// ページネーション制御（最大5ページまで）
+	maxPages := 5
+	currentPage := 1
+
+	c.OnHTML(".pagination a[href]", func(e *colly.HTMLElement) {
+		if currentPage >= maxPages {
+			return
+		}
+
+		if strings.Contains(e.Text, "次へ") {
+			currentPage++
+			nextURL := e.Request.AbsoluteURL(e.Attr("href"))
+			logger.Info("次のページへ遷移",
+				zap.String("url", nextURL),
+				zap.Int("current_page", currentPage))
+			e.Request.Visit(nextURL)
+		}
+	})
+
+	startURL := baseURL
+	if filterParam != "" {
+		startURL += "?" + filterParam
+	}
+	c.Visit(startURL)
+	c.Wait()
+
 	return articles
 }
 
 // scrapeKabutanIR リアルタイムIR用スクレイパー
 func scrapeKabutanIR(logger *zap.Logger, filterParam string) []map[string]interface{} {
-	base := "https://kabutan.jp/news/"
-	startURL := base
+	c := colly.NewCollector(
+		colly.AllowedDomains("kabutan.jp"),
+		colly.Async(true),
+		colly.CacheDir("./.cache"),
+	)
+
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: viper.GetInt("scraping.parallelism"),
+		RandomDelay: time.Duration(viper.GetInt("scraping.delay_seconds")) * time.Second,
+	})
+
+	articles := make([]map[string]interface{}, 0)
+	baseURL := "https://kabutan.jp/news/"
+
+	c.OnHTML("#news_contents .s_news_list tr", func(e *colly.HTMLElement) {
+		article := map[string]interface{}{
+			"date":       e.ChildAttr("td.news_time time", "datetime"),
+			"category":   e.ChildText("td:nth-child(2) div.newslist_ctg"),
+			"is_urgent":  strings.Contains(e.ChildAttr("td:nth-child(2) div.newslist_ctg", "class"), "kk_b"),
+			"stock_code": e.ChildAttr("td:nth-child(3)", "data-code"),
+			"title":      e.ChildText("td:nth-child(4) a"),
+			"url":        e.Request.AbsoluteURL(e.ChildAttr("td:nth-child(4) a", "href")),
+		}
+
+		if !hasRequiredFields(article) {
+			logger.Warn("必須フィールド検証エラー（IR記事）", zap.Any("article", article))
+			return
+		}
+
+		norm, err := normalizeURL(article["url"].(string))
+		if err != nil {
+			logger.Warn("IR記事URL正規化エラー", zap.Error(err), zap.String("original_url", article["url"].(string)))
+			return
+		}
+		article["url"] = norm
+
+		hash := generateHash(article["title"].(string), article["url"].(string), norm)
+		var exist Article
+		if err := db.Where("url = ? OR hash = ?", norm, hash).First(&exist).Error; err == nil {
+			logger.Info("重複IR記事をスキップ", zap.String("title", article["title"].(string)), zap.String("hash", hash))
+			return
+		}
+
+		errMutex.Lock()
+		defer errMutex.Unlock()
+		maxIRArticles := viper.GetInt("scraping.max_articles.ir")
+		if len(articles) >= maxIRArticles {
+			logger.Info("IR記事最大取得数に達したため処理を停止",
+				zap.Int("max_articles", maxIRArticles))
+			return
+		}
+
+		if err := db.Create(&Article{
+			Title:       article["title"].(string),
+			URL:         norm,
+			Hash:        hash,
+			Content:     fmt.Sprintf("IRカテゴリ: %s", article["category"].(string)),
+			Category:    article["category"].(string),
+			PublishedAt: time.Now(),
+		}).Error; err != nil {
+			logger.Error("IR記事保存失敗", zap.Error(err))
+		} else {
+			articles = append(articles, article)
+			if len(articles) >= maxIRArticles {
+				logger.Info("IR記事最大取得数に達したため処理を停止",
+					zap.Int("max_articles", maxIRArticles))
+				return
+			}
+		}
+	})
+
+	// ページネーション無効化（高頻度クローリングのため）
+	// c.OnHTML(".pagination a[href]", func(e *colly.HTMLElement) {})
+
+	startURL := baseURL
 	if filterParam != "" {
 		startURL += "?" + filterParam
 	}
-
-	articles := make([]map[string]interface{}, 0)
-	l := launcher.New().Headless(true)
-	defer l.Cleanup()
-	browser := rod.New().ControlURL(l.MustLaunch()).MustConnect()
-	defer browser.MustClose()
-
-	page := browser.MustPage(startURL)
-
-	for {
-		page.MustWaitLoad().MustWaitIdle()
-		rows := page.MustElements("#news_contents .s_news_list tr")
-
-		for _, row := range rows {
-			article := make(map[string]interface{})
-			if tEl, err := row.Element("td.news_time time"); err == nil {
-				if dt, _ := tEl.Attribute("datetime"); dt != nil {
-					article["date"] = *dt
-				}
-			}
-			if cEl, err := row.Element("td:nth-child(2) div.newslist_ctg"); err == nil {
-				article["category"] = cEl.MustText()
-				if cl, _ := cEl.Attribute("class"); cl != nil {
-					article["is_urgent"] = strings.Contains(*cl, "kk_b")
-				}
-			}
-			if codeEl, err := row.Element("td:nth-child(3)"); err == nil {
-				if cd, _ := codeEl.Attribute("data-code"); cd != nil {
-					article["stock_code"] = *cd
-				}
-			}
-			if titleEl, err := row.Element("td:nth-child(4) a"); err == nil {
-				article["title"] = titleEl.MustText()
-				if href, _ := titleEl.Attribute("href"); href != nil {
-					u, _ := url.Parse(base)
-					article["url"] = u.ResolveReference(&url.URL{Path: *href}).String()
-				}
-			}
-
-			if !hasRequiredFields(article) {
-				logger.Warn("必須フィールド検証エラー（IR記事）",
-					zap.Any("article", article),
-					zap.String("url", page.MustInfo().URL),
-				)
-				continue
-			}
-
-			// URL正規化と重複チェック
-			norm, err := normalizeURL(article["url"].(string))
-			if err != nil {
-				logger.Warn("IR記事URL正規化エラー", 
-					zap.Error(err),
-					zap.String("original_url", article["url"].(string)),
-				)
-				continue
-			}
-			article["url"] = norm
-
-			hash := generateHash(article["title"].(string), article["url"].(string), norm)
-			var exist Article
-			if err := db.Where("url = ? OR hash = ?", norm, hash).First(&exist).Error; err == nil {
-				logger.Info("重複IR記事をスキップ",
-					zap.String("title", article["title"].(string)),
-					zap.String("hash", hash),
-				)
-				continue
-			}
-
-			// DB保存処理
-			errMutex.Lock()
-			if err := db.Create(&Article{
-				Title:       article["title"].(string),
-				URL:         norm,
-				Hash:        hash,
-				Content:     fmt.Sprintf("IRカテゴリ: %s", article["category"].(string)),
-				Category:    article["category"].(string),
-				PublishedAt: time.Now(),
-			}).Error; err != nil {
-				logger.Error("IR記事保存失敗", zap.Error(err))
-			} else {
-				articles = append(articles, article)
-			}
-			errMutex.Unlock()
-		}
-
-		// 次ページ処理（3回リトライ）
-		var nextHref string
-		for retry := 0; retry < 3; retry++ {
-			nextLink, err := page.Element("a:contains('次へ＞')")
-			if err != nil || nextLink == nil {
-				break
-			}
-			
-			if href, err := nextLink.Attribute("href"); err == nil && href != nil {
-				nextHref = *href
-				break
-			}
-			
-			logger.Warn("次ページリンク取得リトライ", 
-				zap.Int("attempt", retry+1),
-				zap.String("url", page.MustInfo().URL),
-			)
-			time.Sleep(time.Duration(retry+1) * time.Second)
-		}
-
-		if nextHref == "" {
-			break
-		}
-
-		// 正規化されたURLで新しいページを開く
-		u, err := url.Parse(nextHref)
-		if err != nil {
-			logger.Error("URL解析エラー", 
-				zap.String("href", nextHref),
-				zap.Error(err),
-			)
-			break
-		}
-		page = browser.MustPage(u.String())
-	}
+	c.Visit(startURL)
+	c.Wait()
 
 	return articles
 }
 
 func hasRequiredFields(article map[string]interface{}) bool {
 	required := map[string]func(interface{}) bool{
-		"date":       func(v interface{}) bool { _, ok := v.(string); return ok },
-		"category":   func(v interface{}) bool { _, ok := v.(string); return ok },
-		"title":      func(v interface{}) bool { _, ok := v.(string); return ok },
-		"url":        func(v interface{}) bool { _, ok := v.(string); return ok },
-		"stock_code": func(v interface{}) bool { 
+		"date":     func(v interface{}) bool { _, ok := v.(string); return ok },
+		"category": func(v interface{}) bool { _, ok := v.(string); return ok },
+		"title":    func(v interface{}) bool { _, ok := v.(string); return ok },
+		"url":      func(v interface{}) bool { _, ok := v.(string); return ok },
+		"stock_code": func(v interface{}) bool {
 			s, ok := v.(string)
 			return ok && len(s) == 4 && strings.Trim(s, "0123456789") == ""
 		},
@@ -384,7 +389,7 @@ func hasRequiredFields(article map[string]interface{}) bool {
 			return false
 		}
 	}
-	
+
 	// 日付形式の検証
 	if _, err := time.Parse(time.RFC3339, article["date"].(string)); err != nil {
 		return false
@@ -406,8 +411,67 @@ func normalizeURL(rawURL string) (string, error) {
 	// %3F → ? 置換
 	decodedPath = strings.ReplaceAll(decodedPath, "%3F", "?")
 	u.Path = decodedPath
-	
+
 	return fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, u.Path), nil
+}
+
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..." // 切り詰め末尾に省略記号を追加
+}
+
+func getSummaryForDisplay(article map[string]interface{}) string {
+	if summary, ok := article["summary"].(string); ok && summary != "" {
+		return summary
+	}
+	return "要約生成中... しばらくお待ちください"
+}
+
+func getArticleBody(logger *zap.Logger, url string) string {
+	c := colly.NewCollector(
+		colly.Async(true),
+		colly.MaxDepth(2),
+	)
+
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 3,
+		RandomDelay: 1 * time.Second,
+	})
+
+	var body strings.Builder
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	c.OnHTML("#news_body", func(e *colly.HTMLElement) {
+		defer wg.Done()
+		content := strings.TrimSpace(e.Text)
+		if content == "" {
+			logger.Warn("本文コンテンツが空です", zap.String("url", url))
+			return
+		}
+		body.WriteString(content)
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		defer wg.Done()
+		logger.Error("記事本文の取得に失敗しました",
+			zap.String("url", url),
+			zap.Int("status_code", r.StatusCode),
+			zap.Error(err))
+	})
+
+	if err := c.Visit(url); err != nil {
+		logger.Error("リクエスト開始に失敗しました",
+			zap.String("url", url),
+			zap.Error(err))
+		return ""
+	}
+
+	wg.Wait()
+	return body.String()
 }
 
 func generateHash(title, rawURL, normalizedURL string) string {
@@ -436,9 +500,11 @@ func processAndNotify(discord *discordgo.Session, logger *zap.Logger, data []map
 				URL:     "https://kabutan.jp/news/",
 				IconURL: "https://kabutan.jp/favicon.ico",
 			},
-			Title:       article["title"].(string),
-			URL:         article["url"].(string),
-			Description: fmt.Sprintf("**カテゴリ**: %s", article["category"].(string)),
+			Title: article["title"].(string),
+			URL:   article["url"].(string),
+			Description: fmt.Sprintf("**カテゴリ**: %s\n**本文**:\n%s", 
+				article["category"].(string),
+				truncateString(article["body"].(string), 1000)),
 			Fields: []*discordgo.MessageEmbedField{
 				{Name: "銘柄コード", Value: article["stock_code"].(string), Inline: true},
 				{Name: "公開日時", Value: article["date"].(string), Inline: true},
@@ -446,7 +512,7 @@ func processAndNotify(discord *discordgo.Session, logger *zap.Logger, data []map
 			Color:     color,
 			Timestamp: article["date"].(string),
 			Thumbnail: &discordgo.MessageEmbedThumbnail{URL: fmt.Sprintf("https://kabutan.jp/stock/?code=%s&image=logo", article["stock_code"].(string))},
-			Footer: &discordgo.MessageEmbedFooter{Text: "Powered by Kabutan Scraper"},
+			Footer:    &discordgo.MessageEmbedFooter{Text: "Powered by Kabutan Scraper"},
 		}
 		if _, err := discord.ChannelMessageSendEmbed(channelID, embed); err != nil {
 			logger.Error("Discord通知に失敗", zap.Error(err))
@@ -459,41 +525,83 @@ func processUrgentNotifications(discord *discordgo.Session, logger *zap.Logger, 
 	if channelID == "" {
 		channelID = viper.GetString("discord.alert_channel")
 	}
+	
 	for _, article := range data {
-		if urgent, ok := article["is_urgent"].(bool); !ok || !urgent {
+		// 型アサーションの前に存在チェックを追加
+		urgent, _ := article["is_urgent"].(bool)
+		if !urgent {
 			continue
 		}
+
+		// フィールドの存在チェックを追加
+		var (
+			title, url, stockCode, category, body, date string
+			ok bool
+		)
+
+		if title, ok = article["title"].(string); !ok {
+			logger.Error("記事タイトルが不正な形式です", zap.Any("article", article))
+			continue
+		}
+		if url, ok = article["url"].(string); !ok {
+			logger.Error("記事URLが不正な形式です", zap.Any("article", article))
+			continue
+		}
+		if stockCode, ok = article["stock_code"].(string); !ok {
+			logger.Error("銘柄コードが不正な形式です", zap.Any("article", article))
+			continue
+		}
+		if category, ok = article["category"].(string); !ok {
+			logger.Error("カテゴリが不正な形式です", zap.Any("article", article))
+			continue
+		}
+		if body, ok = article["body"].(string); !ok {
+			body = "本文がありません"
+		}
+		if date, ok = article["date"].(string); !ok {
+			date = "日時不明"
+		}
+
 		embed := &discordgo.MessageEmbed{
 			Author: &discordgo.MessageEmbedAuthor{
 				Name:    "🚨 緊急IR通知 🚨",
 				IconURL: "https://kabutan.jp/favicon.ico",
 			},
-			Title:       article["title"].(string),
-			URL:         article["url"].(string),
-			Description: fmt.Sprintf("**銘柄コード**: %s\n**カテゴリ**: %s", article["stock_code"], article["category"]),
+			Title:       title,
+			URL:         url,
+			Description: fmt.Sprintf("**銘柄コード**: %s\n**カテゴリ**: %s\n**本文**:\n%s", 
+				stockCode, 
+				category,
+				truncateString(body, 1000)),
 			Fields: []*discordgo.MessageEmbedField{
-				{Name: "発表時刻", Value: article["date"].(string), Inline: true},
+				{Name: "発表時刻", Value: date, Inline: true},
 			},
 			Color:     0xFF0000,
-			Timestamp: article["date"].(string),
+			Timestamp: date,
 			Footer:    &discordgo.MessageEmbedFooter{Text: "ver1.0.2"},
 		}
 		if _, err := discord.ChannelMessageSendEmbed(channelID, embed); err != nil {
-			logger.Error("緊急通知に失敗", zap.Error(err))
+			logger.Error("緊急通知に失敗", 
+				zap.Error(err),
+				zap.String("title", title),
+				zap.String("url", url))
 		}
 	}
 }
 
-
 type Article struct {
-	ID        uint      `gorm:"primaryKey"`
-	Site      string    `gorm:"index"`
-	Title     string
-	URL       string    `gorm:"uniqueIndex;size:500"`
-	Hash      string    `gorm:"uniqueIndex;size:64"`
-	Content   string
-	Category  string
-	PublishedAt time.Time
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID            uint   `gorm:"primaryKey"`
+	Site          string `gorm:"index"`
+	Title         string
+	URL           string `gorm:"uniqueIndex;size:500"`
+	Hash          string `gorm:"uniqueIndex;size:64"`
+	Content       string
+	Body          string `gorm:"type:text"`
+	Summary       string `gorm:"type:text"`
+	Category      string
+	PublishedAt   time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	LastScrapedAt time.Time // 最終スクレイピング日時を追跡
+	RetryCount    int       // リトライ回数を追跡
 }
