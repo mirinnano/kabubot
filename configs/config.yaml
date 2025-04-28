@@ -1,0 +1,39 @@
+discord:
+  token: ""
+  alert_channel: "1365974380076859452"
+  log_channel: "1365974403929739375"
+
+scraping:
+  interval: "*/1 * * * *"
+  summary_interval: "0 */6 * * *"
+  user_agent: "Mozilla/5.0 (compatible; StockBot/1.0; +http://example.com)"
+  timeout: 10
+  kabutan_urls:
+    - "https://kabutan.jp/news/marketnews/"
+    - "https://kabutan.jp/news/"
+    - "https://kabutan.jp/warning/"
+    - "https://kabutan.jp/tansaku/"
+  article_storage: "C:/Users/ren-k/Desktop/bot/articles.db"
+
+financial_metrics:
+  targets: ["PER", "PBR", "ROE", "株価"]
+  alert_thresholds:
+    PER: 20
+    PBR: 1.5
+
+ai:
+  provider: "deepseek"
+  api_key: "${DEEPSEEK_API_KEY}"
+  endpoint: "https://api.deepseek.com/chat/completions"
+  model: "deepseek-chat"
+  timeout: 5000
+
+screening:
+  conditions:
+    financial:
+      - "PER <= 15"
+      - "PBR <= 1.5"
+      - "ROE >= 10"
+    growth:
+      - "営業利益率前年比 >= 15%"
+      - "研究開発費増加率 >= 20%"
