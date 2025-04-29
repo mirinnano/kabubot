@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"bot/command"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -16,13 +16,14 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
-
+"regexp"
 	"bot/config"
 	"bot/handlers"
 	"bot/services"
 
 	"github.com/bwmarrin/discordgo"
 )
+const version = "v1.2.0"
 
 var (
 	// 各スクレイパーは filterParam を受け取るシグネチャに統一
@@ -42,7 +43,7 @@ func initDB() {
 	}
 
 	// 自動マイグレーション
-	db.AutoMigrate(&Article{})
+	db.AutoMigrate(&Article{}, TradersArticle{})
 }
 
 func main() {
@@ -75,7 +76,9 @@ func main() {
 			zap.Float64("接続遅延(ms)", s.HeartbeatLatency().Seconds()*1000),
 		)
 	})
-	
+	if err := commands.RegisterAll(discord, logger); err != nil {
+		logger.Fatal("スラッシュコマンド登録に失敗しました", zap.Error(err))
+}
 
 	var cfg config.Config
 	if err := viper.Unmarshal(&cfg); err != nil {
@@ -98,29 +101,6 @@ func main() {
 		}
 	})
 
-	// リアルタイムIR通知モード（市場時間中30秒間隔）
-	// 6時間前からの記事を要約するタスク
-	scheduler.AddTask("0 */6 * * *", func() {
-		var articles []Article
-		sixHoursAgo := time.Now().Add(-6 * time.Hour)
-
-		if result := db.Where("published_at >= ? AND summary = ''", sixHoursAgo).Find(&articles); result.Error != nil {
-			logger.Error("要約対象記事の取得に失敗しました", zap.Error(result.Error))
-			return
-		}
-
-		logger.Info("要約処理を開始します",
-			zap.Int("対象記事数", len(articles)),
-			zap.Time("基準時刻", sixHoursAgo))
-
-		for _, article := range articles {
-			if err := summaryService.GenerateAndStoreSummary(context.Background(), int(article.ID), article.Body); err != nil {
-				logger.Error("記事要約に失敗しました",
-					zap.Int("article_id", int(article.ID)),
-					zap.Error(err))
-			}
-		}
-	})
 
 	// リアルタイムIR通知モード（市場時間中30秒間隔）
 	scheduler.AddTask("*/1 * * * *", func() {
@@ -133,43 +113,15 @@ func main() {
 		}
 	})
 
-	// 6時間ごとの本文再取得タスク
-	scheduler.AddTask("0 */6 * * *", func() {
-		var articles []Article
-		twentyFourHoursAgo := time.Now().Add(-24 * time.Hour)
+	scheduler.AddTask("*/1 * * * *", func() {
+    arts, err := ScrapeTradersNews(logger,db,"")
+    if err != nil {
+        logger.Error("TradersNews スクレイピング失敗", zap.Error(err))
+        return
+    }
+    processTradersNotify(discord, logger, arts)
+})
 
-		// 最終スクレイピングから24時間以上経過かつリトライ回数3回未満の記事を取得
-		if result := db.Where("last_scraped_at < ? AND retry_count < ?", twentyFourHoursAgo, 3).Find(&articles); result.Error != nil {
-			logger.Error("再スクレイピング対象記事の取得に失敗しました", zap.Error(result.Error))
-			return
-		}
-
-		logger.Info("本文の再スクレイピングを開始します",
-			zap.Int("対象記事数", len(articles)),
-			zap.Time("基準時刻", twentyFourHoursAgo))
-
-		for _, article := range articles {
-			newBody := getArticleBody(logger, article.URL)
-			if newBody != "" && newBody != article.Body {
-				// 本文が更新されている場合のみデータベースを更新
-				updateResult := db.Model(&article).Updates(map[string]interface{}{
-					"body":            newBody,
-					"last_scraped_at": time.Now(),
-					"retry_count":     gorm.Expr("retry_count + 1"),
-				})
-
-				if updateResult.Error != nil {
-					logger.Error("本文更新に失敗しました",
-						zap.Int("article_id", int(article.ID)),
-						zap.Error(updateResult.Error))
-				} else {
-					logger.Info("本文を正常に更新しました",
-						zap.Int("article_id", int(article.ID)),
-						zap.Int("文字数", len(newBody)))
-				}
-			}
-		}
-	})
 	scheduler.Start()
 	// メインスレッドをブロック（ハートビート付き）
 	logger.Info("メインスレッドを起動しました")
@@ -180,6 +132,171 @@ func main() {
 		logger.Info("システムは動作中です",
 			zap.Time("最終チェック", time.Now()),
 		)
+	}
+}
+
+type TradersArticle struct {
+	ID          uint      `gorm:"primaryKey"`
+	Title       string    `gorm:"size:500"`
+	URL         string    `gorm:"uniqueIndex;size:500"`
+	Hash        string    `gorm:"uniqueIndex;size:64"`
+	Category    string    `gorm:"size:100"`
+	PublishedAt time.Time
+	CreatedAt   time.Time
+}
+var weekdayRE = regexp.MustCompile(`\(.+?\)`)
+func ScrapeTradersNews(logger *zap.Logger, db *gorm.DB, filterParam string) ([]TradersArticle, error) {
+	baseURL := "https://www.traders.co.jp/news/list/ALL/1"
+	if filterParam != "" {
+		baseURL += "?" + filterParam
+	}
+	const maxArticles = 10
+	var newArticles []TradersArticle
+	c := colly.NewCollector(colly.UserAgent("Mozilla/5.0"))
+
+	c.OnRequest(func(r *colly.Request) {
+		logger.Info("訪問開始", zap.String("url", r.URL.String()))
+	})
+
+	c.OnHTML(".news_container", func(e *colly.HTMLElement) {
+		// 日時パース: "2025/04/29(火) 18:13" → "2025/04/29 18:13"
+		if len(newArticles) >= maxArticles {
+			return
+		}
+		// 日時パース: "2025/04/29(火) 18:13"等 → "2025/04/29 18:13"
+		// 生の日時文字列取得
+		ts := e.ChildText(".timestamp")
+		ts = weekdayRE.ReplaceAllString(ts, "")
+		
+		ts = strings.TrimSpace(ts)
+// JST ロケーションを読み込む
+loc, err := time.LoadLocation("Asia/Tokyo")
+if err != nil {
+    logger.Error("ロケーションロード失敗", zap.Error(err))
+    loc = time.FixedZone("JST", 9*3600)  // フォールバック
+}
+		// パース処理
+		layout := "2006/01/02 15:04"
+		parsedTime, err := time.ParseInLocation(layout, ts, loc)
+		if err != nil {
+				logger.Warn("日時パースエラー", zap.String("raw", ts), zap.Error(err))
+				return
+		}
+
+	
+
+		// タイトル + URL
+		title := e.ChildText(".news_headline a.news_link")
+		href := e.ChildAttr(".news_headline a.news_link", "href")
+		if title == "" || href == "" {
+			logger.Info("必須項目不足、スキップ", zap.String("title", title))
+			return
+		}
+
+		fullURL := resolveURL("https://www.traders.co.jp", href)
+
+		// ハッシュ生成
+		hash := generateHashs(title, fullURL)
+
+		// 重複チェック
+		var exist TradersArticle
+		if err := db.Where("url = ? OR hash = ?", fullURL, hash).First(&exist).Error; err == nil {
+			logger.Info("すでに存在する記事、スキップ", zap.String("title", title))
+			return
+		}
+
+
+// 汎用ボタン生成ヘルパー
+
+		// DB保存
+		article := TradersArticle{
+			Title:       title,
+			URL:         fullURL,
+			Hash:        hash,
+			Category:    "トレーダーズ",
+			PublishedAt: parsedTime,
+		}
+		if err := db.Create(&article).Error; err != nil {
+			logger.Error("記事保存失敗", zap.String("title", title), zap.Error(err))
+			return
+		}
+
+		newArticles = append(newArticles, article)
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		logger.Error("Traders news crawl error", zap.Int("status", r.StatusCode), zap.Error(err))
+	})
+
+	if err := c.Visit(baseURL); err != nil {
+		return nil, fmt.Errorf("サイト訪問エラー: %w", err)
+	}
+
+	return newArticles, nil
+}
+func resolveURL(baseStr, path string) string {
+	u, _ := url.Parse(baseStr)
+	r, _ := url.Parse(path)
+	return u.ResolveReference(r).String()
+}
+func generateHashs(title, fullURL string) string {
+	h := sha256.New()
+	h.Write([]byte(title))
+	h.Write([]byte(fullURL))
+	return hex.EncodeToString(h.Sum(nil))
+}
+func newLinkButton(label, url string) discordgo.MessageComponent {
+	return discordgo.Button{
+			Label:    label,
+			Style:    discordgo.LinkButton,
+			URL:      url,
+			Emoji:    &discordgo.ComponentEmoji{Name: "🔗"},
+			Disabled: false,
+	}
+}
+
+func processTradersNotify(s *discordgo.Session, logger *zap.Logger, arts []TradersArticle) {
+	channelID := viper.GetString("discord.alert_channel")
+	var categoryColors = map[string]int{
+    "決算":    0xFF4500,
+    "決算修正": 0xFF6347,
+    "市場速報": 0x00BFFF,
+    "トレーダーズ": 0x0099FF,
+}
+	for _, art := range arts {
+			color := categoryColors["トレーダーズ"]
+
+			embed := &discordgo.MessageEmbed{
+					Author: &discordgo.MessageEmbedAuthor{
+							Name:    "📰 Traders ニュース",
+							IconURL: "https://www.traders.co.jp/static/favicon.ico?m=1642666535",
+					},
+					Title:       art.Title,
+					URL:         art.URL,
+					Description: "最新トレーダーズニュースを配信します",
+					Fields: []*discordgo.MessageEmbedField{
+							{Name: "公開日時", Value: art.PublishedAt.Format(time.RFC3339), Inline: true},
+					},
+					Color:     color,
+					Timestamp: art.PublishedAt.Format(time.RFC3339),
+					Footer:    &discordgo.MessageEmbedFooter{Text: "Powered by Traders Scraper "+ version, IconURL: "	https://www.traders.co.jp/static/favicon.ico?m=1642666535"},
+					Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://www.traders.co.jp/static/favicon.ico?m=1642666535"},
+			}
+
+			components := []discordgo.MessageComponent{
+					discordgo.ActionsRow{
+							Components: []discordgo.MessageComponent{
+									newLinkButton("記事へ", art.URL),
+							},
+					},
+			}
+
+			if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+					Embed:      embed,
+					Components: components,
+			}); err != nil {
+					logger.Error("Traders通知失敗", zap.Error(err))
+			}
 	}
 }
 
@@ -431,57 +548,6 @@ func truncateString(s string, max int) string {
 	return s[:max] + "..." // 切り詰め末尾に省略記号を追加
 }
 
-func getSummaryForDisplay(article map[string]interface{}) string {
-	if summary, ok := article["summary"].(string); ok && summary != "" {
-		return summary
-	}
-	return "要約生成中... しばらくお待ちください"
-}
-
-func getArticleBody(logger *zap.Logger, url string) string {
-	c := colly.NewCollector(
-		colly.Async(true),
-		colly.MaxDepth(2),
-	)
-
-	c.Limit(&colly.LimitRule{
-		DomainGlob:  "*",
-		Parallelism: 3,
-		RandomDelay: 1 * time.Second,
-	})
-
-	var body strings.Builder
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	c.OnHTML("#news_body", func(e *colly.HTMLElement) {
-		defer wg.Done()
-		content := strings.TrimSpace(e.Text)
-		if content == "" {
-			logger.Warn("本文コンテンツが空です", zap.String("url", url))
-			return
-		}
-		body.WriteString(content)
-	})
-
-	c.OnError(func(r *colly.Response, err error) {
-		defer wg.Done()
-		logger.Error("記事本文の取得に失敗しました",
-			zap.String("url", url),
-			zap.Int("status_code", r.StatusCode),
-			zap.Error(err))
-	})
-
-	if err := c.Visit(url); err != nil {
-		logger.Error("リクエスト開始に失敗しました",
-			zap.String("url", url),
-			zap.Error(err))
-		return ""
-	}
-
-	wg.Wait()
-	return body.String()
-}
 
 func generateHash(title, rawURL, normalizedURL string) string {
 	h := sha256.New()
@@ -491,108 +557,122 @@ func generateHash(title, rawURL, normalizedURL string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func processAndNotify(discord *discordgo.Session, logger *zap.Logger, data []map[string]interface{}) {
+func processAndNotify(s *discordgo.Session, logger *zap.Logger, data []map[string]interface{}) {
 	channelID := viper.GetString("discord.alert_channel")
-	for _, article := range data {
-		// カラーマッピング
-		color := 0x00FF00 // デフォルト緑
+	var categoryColors = map[string]int{
+    "決算":    0xFF4500,
+    "決算修正": 0xFF6347,
+    "市場速報": 0x00BFFF,
+    "トレーダーズ": 0x0099FF,
+}
+	for _, art := range data {
+			title := art["title"].(string)
+			url := art["url"].(string)
+			category := art["category"].(string)
+			date := art["date"].(string)
 
-		embed := &discordgo.MessageEmbed{
-			Author: &discordgo.MessageEmbedAuthor{
-					Name:    "速報",
-					IconURL: "https://kabutan.jp/favicon.ico",
-			},
-			Title:       article["title"].(string),
-			URL:         article["url"].(string),
-			Description: fmt.Sprintf("**カテゴリ**: %s\n", article["category"].(string)),  // ←ここで閉じる
-			Fields: []*discordgo.MessageEmbedField{                                        // ←そしてカンマ
-					{
-							Name:   "公開日時",
-							Value:  article["date"].(string),
-							Inline: true,
+			color := categoryColors[category]
+			if color == 0 {
+					color = 0x00FF00
+			}
+
+			embed := &discordgo.MessageEmbed{
+					Author: &discordgo.MessageEmbedAuthor{
+							Name:    fmt.Sprintf("📢 市場速報 - %s", category),
+							IconURL: "https://kabutan.jp/favicon.ico",
 					},
-					// 必要なら他のフィールドも
-			},
-			Color:     color,
-			Timestamp: article["date"].(string),
-			Footer:    &discordgo.MessageEmbedFooter{Text: "Powered by Kabutan Scraper ver1.1.0"},
-	}
-	
-		if _, err := discord.ChannelMessageSendEmbed(channelID, embed); err != nil {
-			logger.Error("Discord通知に失敗", zap.Error(err))
-		}
+					Title:       title,
+					URL:         url,
+					Description: fmt.Sprintf("**カテゴリ**: %s", category),
+					Fields: []*discordgo.MessageEmbedField{
+							{Name: "公開日時", Value: date, Inline: true},
+					},
+					Color:     color,
+					Timestamp: date,
+					Footer:    &discordgo.MessageEmbedFooter{Text: "Powered by Kabutan Scraper "+ version, IconURL: "https://kabutan.jp/favicon.ico"},
+					Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://kabutan.jp/favicon.ico"},
+			}
+
+			components := []discordgo.MessageComponent{
+					discordgo.ActionsRow{
+							Components: []discordgo.MessageComponent{
+									newLinkButton("続きを読む", url),
+							},
+					},
+			}
+
+			if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+					Embed:      embed,
+					Components: components,
+			}); err != nil {
+					logger.Error("速報通知失敗", zap.Error(err))
+			}
 	}
 }
 
-func processUrgentNotifications(discord *discordgo.Session, logger *zap.Logger, data []map[string]interface{}) {
+func processUrgentNotifications(s *discordgo.Session, logger *zap.Logger, data []map[string]interface{}) {
 	channelID := viper.GetString("discord.urgent_channel")
 	if channelID == "" {
-		channelID = viper.GetString("discord.alert_channel")
+			channelID = viper.GetString("discord.alert_channel")
 	}
+	var categoryColors = map[string]int{
+    "決算":    0xFF4500,
+    "決算修正": 0xFF6347,
+    "市場速報": 0x00BFFF,
+    "トレーダーズ": 0x0099FF,
+}
+	for _, art := range data {
+			urgent, _ := art["is_urgent"].(bool)
+			if !urgent {
+					continue
+			}
+			title, _ := art["title"].(string)
+			url, _ := art["url"].(string)
+			stockCode, _ := art["stock_code"].(string)
+			category, _ := art["category"].(string)
+			body, _ := art["body"].(string)
+			date, _ := art["date"].(string)
 
-	for _, article := range data {
-		// 型アサーションの前に存在チェックを追加
-		urgent, _ := article["is_urgent"].(bool)
-		if !urgent {
-			continue
-		}
+			color := categoryColors[category]
+			if color == 0 {
+					color = 0xFF0000
+			}
 
-		// フィールドの存在チェックを追加
-		var (
-			title, url, stockCode, category, body, date string
-			ok                                          bool
-		)
+			embed := &discordgo.MessageEmbed{
+					Author: &discordgo.MessageEmbedAuthor{
+							Name:    fmt.Sprintf("🚨 速報 - %s", category),
+							IconURL: "https://kabutan.jp/favicon.ico",
+					},
+					Title:       title,
+					URL:         url,
+					Description: truncateString(body, 512),
+					Fields: []*discordgo.MessageEmbedField{
+							{Name: "銘柄コード", Value: stockCode, Inline: true},
+							{Name: "発表時刻", Value: date, Inline: true},
+					},
+					Color:     color,
+					Timestamp: date,
+					Footer:    &discordgo.MessageEmbedFooter{Text: version, IconURL: "https://kabutan.jp/favicon.ico"},
+					Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://kabutan.jp/favicon.ico"},
+			}
 
-		if title, ok = article["title"].(string); !ok {
-			logger.Error("記事タイトルが不正な形式です", zap.Any("article", article))
-			continue
-		}
-		if url, ok = article["url"].(string); !ok {
-			logger.Error("記事URLが不正な形式です", zap.Any("article", article))
-			continue
-		}
-		if stockCode, ok = article["stock_code"].(string); !ok {
-			logger.Error("銘柄コードが不正な形式です", zap.Any("article", article))
-			continue
-		}
-		if category, ok = article["category"].(string); !ok {
-			logger.Error("カテゴリが不正な形式です", zap.Any("article", article))
-			continue
-		}
-		if body, ok = article["body"].(string); !ok {
-			body = "本文がありません"
-		}
-		if date, ok = article["date"].(string); !ok {
-			date = "日時不明"
-		}
+			components := []discordgo.MessageComponent{
+					discordgo.ActionsRow{
+							Components: []discordgo.MessageComponent{
+									newLinkButton("記事を読む", url),
+							},
+					},
+			}
 
-		embed := &discordgo.MessageEmbed{
-			Author: &discordgo.MessageEmbedAuthor{
-				Name:    "🚨 緊急IR通知 🚨",
-				IconURL: "https://kabutan.jp/favicon.ico",
-			},
-			Title: title,
-			URL:   url,
-			Description: fmt.Sprintf("**銘柄コード**: %s\n**カテゴリ**: %s\n**本文**:\n%s",
-				stockCode,
-				category,
-				truncateString(body, 1000)),
-			Fields: []*discordgo.MessageEmbedField{
-				{Name: "発表時刻", Value: date, Inline: true},
-			},
-			Color:     0xFF0000,
-			Timestamp: date,
-			Footer:    &discordgo.MessageEmbedFooter{Text: "ver1.0.2"},
-		}
-		if _, err := discord.ChannelMessageSendEmbed(channelID, embed); err != nil {
-			logger.Error("緊急通知に失敗",
-				zap.Error(err),
-				zap.String("title", title),
-				zap.String("url", url))
-		}
+			if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+					Content:    "",
+					Embed:      embed,
+					Components: components,
+			}); err != nil {
+					logger.Error("緊急通知送信失敗", zap.Error(err))
+			}
 	}
 }
-
 type Article struct {
 	ID            uint   `gorm:"primaryKey"`
 	Site          string `gorm:"index"`
