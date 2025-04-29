@@ -189,7 +189,7 @@ if err != nil {
 		title := e.ChildText(".news_headline a.news_link")
 		href := e.ChildAttr(".news_headline a.news_link", "href")
 		if title == "" || href == "" {
-			logger.Info("必須項目不足、スキップ", zap.String("title", title))
+			logger.Debug("必須項目不足、スキップ", zap.String("title", title))
 			return
 		}
 
