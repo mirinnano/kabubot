@@ -1,5 +1,5 @@
 discord:
-  token: ""
+  token: "dummy"
   alert_channel: "1365974380076859452"
   log_channel: "1365974403929739375"
 
@@ -8,6 +8,10 @@ scraping:
   summary_interval: "0 */6 * * *"
   user_agent: "Mozilla/5.0 (compatible; StockBot/1.0; +http://example.com)"
   timeout: 10
+  max_pages: 3
+  max_articles:
+    ir: 10 
+
   kabutan_urls:
     - "https://kabutan.jp/news/marketnews/"
     - "https://kabutan.jp/news/"

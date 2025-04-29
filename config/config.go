@@ -39,10 +39,7 @@ type ScrapingConfig struct {
 	Timeout         int      `mapstructure:"timeout"`
 	KabutanURLs     []string `mapstructure:"kabutan_urls"`
 	ArticleStorage  string   `mapstructure:"article_storage"`
-	MaxArticles     struct {
-		Regular int `mapstructure:"regular"`
-		IR      int `mapstructure:"ir"`
-	} `mapstructure:"max_articles"`
+	
 	MaxPages      int `mapstructure:"max_pages"`
 	Parallelism   int `mapstructure:"parallelism"`
 	DelaySeconds int `mapstructure:"delay_seconds"`
@@ -78,8 +75,6 @@ func ValidateConfig() error {
 		"discord.token",
 		"scraping.kabutan_urls",
 		"ai.api_key",
-		"scraping.max_articles.regular",
-		"scraping.max_articles.ir",
 	}
 
 	for _, key := range required {
