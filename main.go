@@ -70,7 +70,7 @@ func main() {
 	}
 
 	discord.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-		logger.Info("Discordボットがオンラインです",
+		logger.Debug("Discordボットがオンラインです",
 			zap.String("ユーザー名", r.User.Username),
 			zap.String("ユーザーID", r.User.ID),
 			zap.Float64("接続遅延(ms)", s.HeartbeatLatency().Seconds()*1000),
@@ -96,24 +96,24 @@ func main() {
 		articles := scrapeKabutanArticles(logger, kabutanFilter)
 		status.UpdatePlayingStatus(discord)
 		if len(articles) > 0 {
-			logger.Info("通常スクレイピング結果", zap.Int("記事数", len(articles)))
+			logger.Debug("通常スクレイピング結果", zap.Int("記事数", len(articles)))
 			processAndNotify(discord, logger, articles)
 		}
 	})
 
 
 	// リアルタイムIR通知モード（市場時間中30秒間隔）
-	scheduler.AddTask("*/1 * * * *", func() {
+	scheduler.AddTask("*/2 * * * *", func() {
 		articles := scrapeKabutanIR(logger, irFilter)
 		
 		if len(articles) > 0 {
-			logger.Info("リアルタイムIR検出", zap.Int("件数", len(articles)))
+			logger.Debug("リアルタイムIR検出", zap.Int("件数", len(articles)))
 			// 緊急記事のみ別ルートで通知
 			processUrgentNotifications(discord, logger, articles)
 		}
 	})
 
-	scheduler.AddTask("*/1 * * * *", func() {
+	scheduler.AddTask("*/3 * * * *", func() {
     arts, err := ScrapeTradersNews(logger,db,"")
     if err != nil {
         logger.Error("TradersNews スクレイピング失敗", zap.Error(err))
@@ -155,7 +155,7 @@ func ScrapeTradersNews(logger *zap.Logger, db *gorm.DB, filterParam string) ([]T
 	c := colly.NewCollector(colly.UserAgent("Mozilla/5.0"))
 
 	c.OnRequest(func(r *colly.Request) {
-		logger.Info("訪問開始", zap.String("url", r.URL.String()))
+		logger.Debug("訪問開始", zap.String("url", r.URL.String()))
 	})
 
 	c.OnHTML(".news_container", func(e *colly.HTMLElement) {
@@ -201,7 +201,7 @@ if err != nil {
 		// 重複チェック
 		var exist TradersArticle
 		if err := db.Where("url = ? OR hash = ?", fullURL, hash).First(&exist).Error; err == nil {
-			logger.Info("すでに存在する記事、スキップ", zap.String("title", title))
+			logger.Debug("すでに存在する記事、スキップ", zap.String("title", title))
 			return
 		}
 
@@ -394,7 +394,7 @@ func scrapeKabutanArticles(logger *zap.Logger, filterParam string) []map[string]
 		}).Error; err != nil {
 			logger.Error("記事保存失敗", zap.String("title", article["title"].(string)), zap.Error(err))
 		} else {
-			logger.Info("記事保存成功", zap.String("title", article["title"].(string)))
+			logger.Debug("記事保存成功", zap.String("title", article["title"].(string)))
 			articles = append(articles, article)
 		}
 	})
@@ -419,7 +419,7 @@ func scrapeKabutanIR(logger *zap.Logger, filterParam string) []map[string]interf
 		colly.Async(true),
 		colly.CacheDir("./.cache"),
 	)
-	logger.Info("set")
+	
 
 	c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
@@ -455,7 +455,7 @@ func scrapeKabutanIR(logger *zap.Logger, filterParam string) []map[string]interf
 		hash := generateHash(article["title"].(string), article["url"].(string), norm)
 		var exist Article
 		if err := db.Where("url = ? OR hash = ?", norm, hash).First(&exist).Error; err == nil {
-			logger.Info("重複IR記事をスキップ", zap.String("title", article["title"].(string)), zap.String("hash", hash))
+			logger.Debug("重複IR記事をスキップ", zap.String("title", article["title"].(string)), zap.String("hash", hash))
 			return
 		}
 
@@ -463,7 +463,7 @@ func scrapeKabutanIR(logger *zap.Logger, filterParam string) []map[string]interf
 		defer errMutex.Unlock()
 		maxIRArticles := viper.GetInt("scraping.max_articles.ir")
 		if len(articles) >= maxIRArticles {
-			logger.Info("IR記事最大取得数に達したため処理を停止",
+			logger.Debug("IR記事最大取得数に達したため処理を停止",
 				zap.Int("max_articles", maxIRArticles))
 			return
 		}
@@ -480,7 +480,7 @@ func scrapeKabutanIR(logger *zap.Logger, filterParam string) []map[string]interf
 		} else {
 			articles = append(articles, article)
 			if len(articles) >= maxIRArticles {
-				logger.Info("IR記事最大取得数に達したため処理を停止",
+				logger.Debug("IR記事最大取得数に達したため処理を停止",
 					zap.Int("max_articles", maxIRArticles))
 				return
 			}
