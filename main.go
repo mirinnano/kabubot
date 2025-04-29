@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+	"bot/status"
 	"github.com/glebarez/sqlite"
 	"github.com/gocolly/colly/v2"
 	"github.com/spf13/viper"
@@ -75,6 +75,7 @@ func main() {
 			zap.Float64("接続遅延(ms)", s.HeartbeatLatency().Seconds()*1000),
 		)
 	})
+	
 
 	var cfg config.Config
 	if err := viper.Unmarshal(&cfg); err != nil {
@@ -90,6 +91,7 @@ func main() {
 	// 通常モード（設定ファイルから間隔を取得）
 	scheduler.AddTask(viper.GetString("scraping.interval"), func() {
 		articles := scrapeKabutanArticles(logger, kabutanFilter)
+		status.UpdatePlayingStatus(discord)
 		if len(articles) > 0 {
 			logger.Info("通常スクレイピング結果", zap.Int("記事数", len(articles)))
 			processAndNotify(discord, logger, articles)
@@ -123,6 +125,7 @@ func main() {
 	// リアルタイムIR通知モード（市場時間中30秒間隔）
 	scheduler.AddTask("*/1 * * * *", func() {
 		articles := scrapeKabutanIR(logger, irFilter)
+		
 		if len(articles) > 0 {
 			logger.Info("リアルタイムIR検出", zap.Int("件数", len(articles)))
 			// 緊急記事のみ別ルートで通知
