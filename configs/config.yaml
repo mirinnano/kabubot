@@ -1,7 +1,8 @@
 discord:
-  token: "dummy"
+  token: ""
   alert_channel: "1365974380076859452"
   log_channel: "1365974403929739375"
+  urgent_channel: "1367101038255149069"
 
 scraping:
   interval: "*/1 * * * *"

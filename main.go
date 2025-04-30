@@ -2,28 +2,30 @@ package main
 
 import (
 	"bot/command"
+	"bot/config"
+	"bot/handlers"
+	"bot/services"
+	"bot/status"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"bot/status"
+
 	"github.com/glebarez/sqlite"
 	"github.com/gocolly/colly/v2"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
-"regexp"
-	"bot/config"
-	"bot/handlers"
-	"bot/services"
 
 	"github.com/bwmarrin/discordgo"
 )
-const version = "v1.2.0"
+const version = "v1.2.2"
 
 var (
 	// 各スクレイパーは filterParam を受け取るシグネチャに統一
@@ -79,6 +81,7 @@ func main() {
 	if err := commands.RegisterAll(discord, logger); err != nil {
 		logger.Fatal("スラッシュコマンド登録に失敗しました", zap.Error(err))
 }
+status.StartStatsCollector(logger)
 
 	var cfg config.Config
 	if err := viper.Unmarshal(&cfg); err != nil {
@@ -86,7 +89,7 @@ func main() {
 	}
 	summaryService := services.NewSummaryService(&cfg.AI, logger, db)
 	scheduler := services.NewScheduler(discord, logger, summaryService)
-
+	
 	// フィルターパラメータは設定ファイルから取得可能
 	kabutanFilter := viper.GetString("kabutan.filter") // 通常フィルター
 	irFilter := viper.GetString("kabutan.ir_filter")   // IR専用フィルター
@@ -94,16 +97,20 @@ func main() {
 	// 通常モード（設定ファイルから間隔を取得）
 	scheduler.AddTask(viper.GetString("scraping.interval"), func() {
 		articles := scrapeKabutanArticles(logger, kabutanFilter)
+	
+
 		status.UpdatePlayingStatus(discord)
 		if len(articles) > 0 {
 			logger.Debug("通常スクレイピング結果", zap.Int("記事数", len(articles)))
 			processAndNotify(discord, logger, articles)
 		}
 	})
-
+	scheduler.AddTask("0 * * * *", func() {
+		registerPagingHandler(discord, logger, db)
+})
 
 	// リアルタイムIR通知モード（市場時間中30秒間隔）
-	scheduler.AddTask("*/2 * * * *", func() {
+	scheduler.AddTask("*/1 * * * *", func() {
 		articles := scrapeKabutanIR(logger, irFilter)
 		
 		if len(articles) > 0 {
@@ -113,7 +120,7 @@ func main() {
 		}
 	})
 
-	scheduler.AddTask("*/3 * * * *", func() {
+	scheduler.AddTask("*/2 * * * *", func() {
     arts, err := ScrapeTradersNews(logger,db,"")
     if err != nil {
         logger.Error("TradersNews スクレイピング失敗", zap.Error(err))
@@ -134,6 +141,48 @@ func main() {
 		)
 	}
 }
+func registerPagingHandler(discord *discordgo.Session, logger *zap.Logger, db *gorm.DB) {
+	discord.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			data := i.MessageComponentData()
+			if !strings.HasPrefix(data.CustomID, "hourly_prev:") &&
+				 !strings.HasPrefix(data.CustomID, "hourly_next:") {
+					return
+			}
+
+			parts := strings.Split(data.CustomID, ":")
+			page, err := strconv.Atoi(parts[1])
+			if err != nil {
+					return
+			}
+
+			// Deferred Update 応答
+			if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			}); err != nil {
+					logger.Error("Deferred 応答エラー", zap.Error(err))
+					return
+			}
+
+			// Embed と Components を生成
+			embed, comps := buildHourlyEmbed(logger, db, page)
+			if embed == nil {
+					return
+			}
+
+			// ポインタに包む
+			embeds := []*discordgo.MessageEmbed{embed}
+			components := comps
+
+			// メッセージを編集
+			if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Embeds:     &embeds,      // *[]*discordgo.MessageEmbed
+					Components: &components,  // *[]discordgo.MessageComponent
+			}); err != nil {
+					logger.Error("ページング更新エラー", zap.Error(err))
+			}
+	})
+}
+
 
 type TradersArticle struct {
 	ID          uint      `gorm:"primaryKey"`
@@ -254,6 +303,107 @@ func newLinkButton(label, url string) discordgo.MessageComponent {
 			Disabled: false,
 	}
 }
+const (
+	hourlyItemsPerPage = 8 // １ページあたりの記事数
+)
+
+// ページ数計算
+func totalPages(n, perPage int) int {
+	pages := n / perPage
+	if n%perPage != 0 {
+			pages++
+	}
+	return pages
+}
+
+// Embed 中のタイトルを切り詰め
+func truncate(s string, max int) string {
+	if len(s) <= max {
+			return s
+	}
+	return s[:max] + "…"
+}
+
+// main.go（または適切なファイル）に追加
+func buildHourlyEmbed(logger *zap.Logger, db *gorm.DB, page int) (*discordgo.MessageEmbed, []discordgo.MessageComponent) {
+	cutoff := time.Now().Add(-1 * time.Hour)
+
+	// 直近1時間の記事をDBから取得
+	var recent []Article
+	if err := db.
+			Where("published_at >= ?", cutoff).
+			Order("published_at DESC").
+			Find(&recent).Error; err != nil {
+			logger.Error("DB取得失敗 (hourly)", zap.Error(err))
+			return nil, nil
+	}
+	if len(recent) == 0 {
+			return nil, nil
+	}
+
+	// ページ数計算
+	total := (len(recent)+hourlyItemsPerPage-1) / hourlyItemsPerPage
+	if page < 1 {
+			page = 1
+	} else if page > total {
+			page = total
+	}
+	start := (page - 1) * hourlyItemsPerPage
+	end := start + hourlyItemsPerPage
+	if end > len(recent) {
+			end = len(recent)
+	}
+
+	// Fields 作成
+	fields := make([]*discordgo.MessageEmbedField, 0, end-start)
+	for _, a := range recent[start:end] {
+			t := a.PublishedAt.In(time.FixedZone("JST", 9*3600)).Format("15:04")
+			title := a.Title
+			if len(title) > 50 {
+					title = title[:50] + "…"
+			}
+			fields = append(fields, &discordgo.MessageEmbedField{
+					Name:   t,
+					Value:  fmt.Sprintf("[%s](%s)", title, a.URL),
+					Inline: false,
+			})
+	}
+
+	embed := &discordgo.MessageEmbed{
+			Author: &discordgo.MessageEmbedAuthor{
+					Name:    "🕒 直近1時間のニュース",
+					IconURL: "https://kabutan.jp/favicon.ico",
+			},
+			Description: fmt.Sprintf(
+					"※ %s ～ %s の記事を表示 (Page %d/%d)",
+					cutoff.Format("15:04"), time.Now().Format("15:04"), page, total,
+			),
+			Color:     0x00BFFF,
+			Fields:    fields,
+			Timestamp: time.Now().Format(time.RFC3339),
+			Footer:    &discordgo.MessageEmbedFooter{Text: "Powered by Kabutan Scraper"},
+	}
+
+	// ボタン生成
+	row := discordgo.ActionsRow{}
+	if page > 1 {
+			row.Components = append(row.Components, discordgo.Button{
+					Label:    "◀️ Prev",
+					Style:    discordgo.PrimaryButton,
+					CustomID: fmt.Sprintf("hourly_prev:%d", page-1),
+			})
+	}
+	if page < total {
+			row.Components = append(row.Components, discordgo.Button{
+					Label:    "Next ▶️",
+					Style:    discordgo.PrimaryButton,
+					CustomID: fmt.Sprintf("hourly_next:%d", page+1),
+			})
+	}
+
+	return embed, []discordgo.MessageComponent{row}
+}
+
 
 func processTradersNotify(s *discordgo.Session, logger *zap.Logger, arts []TradersArticle) {
 	channelID := viper.GetString("discord.alert_channel")
@@ -589,6 +739,7 @@ func processAndNotify(s *discordgo.Session, logger *zap.Logger, data []map[strin
 					},
 					Color:     color,
 					Timestamp: date,
+					
 					Footer:    &discordgo.MessageEmbedFooter{Text: "Powered by Kabutan Scraper "+ version, IconURL: "https://kabutan.jp/favicon.ico"},
 					Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://kabutan.jp/favicon.ico"},
 			}
@@ -652,6 +803,13 @@ func processUrgentNotifications(s *discordgo.Session, logger *zap.Logger, data [
 					},
 					Color:     color,
 					Timestamp: date,
+					Image: &discordgo.MessageEmbedImage{  // ← ここで画像を設定
+						URL: fmt.Sprintf(
+								"https://funit.api.kabutan.jp/jp/chart?c=%s&a=1&s=1&m=1&v=%d",
+								stockCode,  // あるいは art.ID や銘柄コードの変数
+								time.Now().Unix(),
+						),
+					},
 					Footer:    &discordgo.MessageEmbedFooter{Text: version, IconURL: "https://kabutan.jp/favicon.ico"},
 					Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://kabutan.jp/favicon.ico"},
 			}

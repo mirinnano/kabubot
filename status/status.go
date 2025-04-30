@@ -2,68 +2,88 @@ package status
 
 import (
 	"fmt"
-	"os"
-	
-
+	"sync"
+	"time"
+"os"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/bwmarrin/discordgo"
+	"go.uber.org/zap"
 )
 
-// SystemStats はシステム稼働状況を保持します。
 type SystemStats struct {
-	Hostname      string  // ホスト名
-	MemoryPercent float64 // メモリ使用率 (%%)
-	CPUPercent    float64 // CPU 使用率 (%%)
+	Hostname      string  // キャッシュ用
+	MemoryPercent float64 // 直近キャッシュ
+	CPUPercent    float64 // 直近キャッシュ
 }
 
-// FetchSystemStats はシステム情報を取得し、SystemStats 構造体として返します。
-func FetchSystemStats() (SystemStats, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return SystemStats{}, err
-	}
+var (
+	stats      SystemStats
+	statsMutex sync.RWMutex
+	logger     *zap.Logger
+)
 
+// StartStatsCollector をアプリ起動時に一度呼び出してください。
+func StartStatsCollector(log *zap.Logger) {
+	logger = log
+
+	// ホスト名は一度だけ取得
+	host, err := os.Hostname()
+	if err != nil {
+			logger.Warn("ホスト名取得に失敗", zap.Error(err))
+	}
+	statsMutex.Lock()
+	stats.Hostname = host
+	statsMutex.Unlock()
+
+	// 10秒間隔でメトリクス取得
+	go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+					refreshStats()
+			}
+	}()
+}
+
+func refreshStats() {
+	// メモリ使用率
 	vm, err := mem.VirtualMemory()
 	if err != nil {
-		return SystemStats{}, err
+			logger.Warn("VirtualMemory 取得エラー", zap.Error(err))
+			return
 	}
 
+	// CPU使用率（前回からの差分ではなく瞬間値を取得）
 	cpuPercents, err := cpu.Percent(0, false)
 	if err != nil {
-		return SystemStats{}, err
+			logger.Warn("CPU Percent 取得エラー", zap.Error(err))
+			return
 	}
 
-	return SystemStats{
-		Hostname:      hostname,
-		MemoryPercent: vm.UsedPercent,
-		CPUPercent:    cpuPercents[0],
-	}, nil
+	statsMutex.Lock()
+	stats.MemoryPercent = vm.UsedPercent
+	if len(cpuPercents) > 0 {
+			stats.CPUPercent = cpuPercents[0]
+	}
+	statsMutex.Unlock()
 }
 
-// buildStatusText は Discord のプロフィール "Playing" 用文字列を生成します。
-func buildStatusText(stats SystemStats) string {
-	// 例: "Mem:45.3% | CPU:10.1% | host123"
-	return fmt.Sprintf(
-		"Mem:%.1f%% | CPU:%.1f%% | %s @aria_math",
-		stats.MemoryPercent,
-		stats.CPUPercent,
-		stats.Hostname,
-	)
-}
-
-// UpdatePlayingStatus は指定セッションのDiscordステータスを "Playing" に更新します。
+// UpdatePlayingStatus は Discord の Playing ステータスを更新します。
+// 内部で重い処理は行わず、キャッシュをフォーマットするだけ。
 func UpdatePlayingStatus(s *discordgo.Session) error {
-	stats, err := FetchSystemStats()
-	if err != nil {
-		return err
-	}
-	statusText := buildStatusText(stats)
-	return s.UpdateStatusComplex(discordgo.UpdateStatusData{
-		Activities: []*discordgo.Activity{{
-			Name: statusText,
+	statsMutex.RLock()
+	st := stats
+	statsMutex.RUnlock()
+
+	activity := &discordgo.Activity{
+			Name: fmt.Sprintf("Mem:%.1f%% | CPU:%.1f%% | %s", st.MemoryPercent, st.CPUPercent, st.Hostname),
 			Type: discordgo.ActivityTypeGame,
-		}},
-		Status: "online",
+	}
+
+	return s.UpdateStatusComplex(discordgo.UpdateStatusData{
+			Activities: []*discordgo.Activity{activity},
+			Status:     "online",
 	})
 }
