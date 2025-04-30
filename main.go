@@ -93,7 +93,7 @@ status.StartStatsCollector(logger)
 	// フィルターパラメータは設定ファイルから取得可能
 	kabutanFilter := viper.GetString("kabutan.filter") // 通常フィルター
 	irFilter := viper.GetString("kabutan.ir_filter")   // IR専用フィルター
-
+	registerPagingHandler(discord, logger, db)
 	// 通常モード（設定ファイルから間隔を取得）
 	scheduler.AddTask(viper.GetString("scraping.interval"), func() {
 		articles := scrapeKabutanArticles(logger, kabutanFilter)
@@ -106,7 +106,7 @@ status.StartStatsCollector(logger)
 		}
 	})
 	scheduler.AddTask("0 * * * *", func() {
-		registerPagingHandler(discord, logger, db)
+		sendHourlyNewsEmbed(discord, logger, db, 1)
 })
 
 	// リアルタイムIR通知モード（市場時間中30秒間隔）
@@ -181,6 +181,21 @@ func registerPagingHandler(discord *discordgo.Session, logger *zap.Logger, db *g
 					logger.Error("ページング更新エラー", zap.Error(err))
 			}
 	})
+}
+// sendHourlyNewsEmbed は、1時間ニュースのEmbedを初回送信します。
+// page 引数は必ず1を渡してください（初回は第1ページ）。
+func sendHourlyNewsEmbed(s *discordgo.Session, logger *zap.Logger, db *gorm.DB, page int) {
+	embed, comps := buildHourlyEmbed(logger, db, page)
+	if embed == nil {
+			return
+	}
+	channelID := viper.GetString("discord.alert_channel")
+	if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+			Embed:      embed,
+			Components: comps,
+	}); err != nil {
+			logger.Error("Hourly embed 送信失敗", zap.Error(err))
+	}
 }
 
 
