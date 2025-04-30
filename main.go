@@ -322,27 +322,11 @@ const (
 	hourlyItemsPerPage = 8 // １ページあたりの記事数
 )
 
-// ページ数計算
-func totalPages(n, perPage int) int {
-	pages := n / perPage
-	if n%perPage != 0 {
-			pages++
-	}
-	return pages
-}
-
-// Embed 中のタイトルを切り詰め
-func truncate(s string, max int) string {
-	if len(s) <= max {
-			return s
-	}
-	return s[:max] + "…"
-}
 
 // main.go（または適切なファイル）に追加
 func buildHourlyEmbed(logger *zap.Logger, db *gorm.DB, page int) (*discordgo.MessageEmbed, []discordgo.MessageComponent) {
-	cutoff := time.Now().Add(-1 * time.Hour)
-
+	cutoff := time.Now().UTC().Add(-1 * time.Hour)
+	var jst = time.FixedZone("JST", 9*3600)
 	// 直近1時間の記事をDBから取得
 	var recent []Article
 	if err := db.
@@ -390,8 +374,10 @@ func buildHourlyEmbed(logger *zap.Logger, db *gorm.DB, page int) (*discordgo.Mes
 					IconURL: "https://kabutan.jp/favicon.ico",
 			},
 			Description: fmt.Sprintf(
-					"※ %s ～ %s の記事を表示 (Page %d/%d)",
-					cutoff.Format("15:04"), time.Now().Format("15:04"), page, total,
+				"※ %s ～ %s の記事を表示 (Page %d/%d)",
+				cutoff.In(jst).Format("15:04"),    // JST に変換
+        time.Now().In(jst).Format("15:04"), // JST に変換
+        page, total,
 			),
 			Color:     0x00BFFF,
 			Fields:    fields,
