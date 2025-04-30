@@ -3,6 +3,7 @@ discord:
   alert_channel: "1365974380076859452"
   log_channel: "1365974403929739375"
   urgent_channel: "1367101038255149069"
+  hourly_News: "1367107655524417536"
 
 scraping:
   interval: "*/1 * * * *"

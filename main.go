@@ -189,7 +189,7 @@ func sendHourlyNewsEmbed(s *discordgo.Session, logger *zap.Logger, db *gorm.DB, 
 	if embed == nil {
 			return
 	}
-	channelID := viper.GetString("discord.alert_channel")
+	channelID := viper.GetString("discord.hourly_News")
 	if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
 			Embed:      embed,
 			Components: comps,
